@@ -340,3 +340,22 @@ def feedback_stats():
         },
     }
     return jsonify(stats)
+
+
+# ---------------------------------------------------------------------------
+# Utility
+# ---------------------------------------------------------------------------
+ 
+def _extract_json(text: str) -> dict:
+    """Pull the first {...} JSON block out of model output."""
+    # Strip markdown fences
+    text = text.replace("```json", "").replace("```", "").strip()
+    start = text.find("{")
+    end   = text.rfind("}") + 1
+    if start == -1 or end == 0:
+        raise json.JSONDecodeError("No JSON object found", text, 0)
+    return json.loads(text[start:end])
+ 
+ 
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
