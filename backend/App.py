@@ -10,44 +10,40 @@ from feedback_loop import load_feedback_examples, format_fewshot_block, build_sy
 from huggingface_hub import InferenceClient
 
 load_dotenv()
- 
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
 )
 logger = logging.getLogger(__name__)
- 
+
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
- 
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-HF_API_KEY = os.getenv("HF_API_KEY", "")          # Hugging Face token
+HF_API_KEY = os.getenv("HF_API_KEY", os.getenv("HF_TOKEN", ""))  # Hugging Face token
+HF_PROVIDER = os.getenv("HF_PROVIDER", "novita")
+
+# Open-source models available via HF / Novita
+MODELS = {
+    "primary":  "meta-llama/Llama-3.1-8B-Instruct",
+    "fallback": "meta-llama/Llama-3.3-70B-Instruct",
+    "fast":     "meta-llama/Llama-3.1-8B-Instruct",
+}
+
+# Old REST-style config kept here for reference only.
 # HF_BASE_URL = "https://api-inference.huggingface.co/models"
- 
-# Open-source models available on HF Inference API (free tier)
-# MODELS = {
-#     "primary":  "meta-llama/Llama-3.1-8B-Instruct",
-#     "fallback": "meta-llama/Llama-3.1-8B-Instruct",
-#     "fast":     "meta-llama/Llama-3.1-8B-Instruct",
+# HEADERS = {
+#     "Authorization": f"Bearer {HF_API_KEY}",
+#     "Content-Type":  "application/json",
 # }
 
-client = InferenceClient(
-    model="meta-llama/Llama-3.1-8B-Instruct",
-    token=HF_API_KEY,
-    provider="novita"
-)
- 
-HEADERS = {
-    "Authorization": f"Bearer {HF_API_KEY}",
-    "Content-Type":  "application/json",
-}
- 
 MAX_TOKENS   = 3000
 TEMPERATURE  = 0.3
 REQUEST_TIMEOUT = 120   # seconds
- 
+
 
 # ---------------------------------------------------------------------------
 # HF Inference helpers
@@ -72,15 +68,16 @@ def _build_instruct_prompt(system: str, user: str, model_id: str) -> str:
         return f"<|system|>\n{system}<|end|>\n<|user|>\n{user}<|end|>\n<|assistant|>"
 
     return f"### System:\n{system}\n\n### User:\n{user}\n\n### Assistant:"
- 
- 
+
+
+# Old REST implementation kept for reference.
 # def call_hf_model(system_prompt: str, user_prompt: str, model_key: str = "primary") -> str:
- 
+#
 #     """Call HF Inference API and return text response."""
 #     model_id = MODELS.get(model_key, MODELS["primary"])
 #     url      = f"{HF_BASE_URL}/{model_id}"
 #     prompt   = _build_instruct_prompt(system_prompt, user_prompt, model_id)
- 
+#
 #     payload = {
 #         "inputs": prompt,
 #         "parameters": {
@@ -92,26 +89,29 @@ def _build_instruct_prompt(system: str, user: str, model_id: str) -> str:
 #         },
 #         "options": {"wait_for_model": True, "use_cache": False},
 #     }
- 
+#
 #     logger.info("Calling HF model: %s", model_id)
 #     resp = requests.post(url, headers=HEADERS, json=payload, timeout=REQUEST_TIMEOUT)
 #     resp.raise_for_status()
- 
+#
 #     data = resp.json()
 #     if isinstance(data, list) and data:
 #         return data[0].get("generated_text", "").strip()
 #     if isinstance(data, dict) and "generated_text" in data:
 #         return data["generated_text"].strip()
- 
+#
 #     raise ValueError(f"Unexpected HF response shape: {data}")
- 
+
 def call_hf_model(system_prompt: str, user_prompt: str, model_key: str = "primary") -> str:
+    if not HF_API_KEY:
+        raise RuntimeError("HF_API_KEY / HF_TOKEN is not set in .env")
+
     model_id = MODELS.get(model_key, MODELS["primary"])
 
     client = InferenceClient(
         model=model_id,
         token=HF_API_KEY,
-        provider="novita"
+        provider=HF_PROVIDER
     )
 
     response = client.chat_completion(
@@ -124,29 +124,32 @@ def call_hf_model(system_prompt: str, user_prompt: str, model_key: str = "primar
     )
 
     return response.choices[0].message.content.strip()
+
+
 def call_hf_with_fallback(system_prompt: str, user_prompt: str) -> tuple[str, str]:
     """Try primary model, fall back gracefully. Returns (text, model_used)."""
+    last_error = None
+
     for key in ("primary", "fallback", "fast"):
+        model_id = MODELS.get(key, MODELS["primary"])
         try:
             text = call_hf_model(system_prompt, user_prompt, key)
-            return text, MODELS[key]
-        except requests.exceptions.HTTPError as exc:
-            status = exc.response.status_code if exc.response else 0
-            logger.warning("Model %s → HTTP %s, trying next", MODELS[key], status)
-            if status == 503:
-                time.sleep(5)   # model loading — brief wait
+            return text, model_id
         except Exception as exc:
-            logger.warning("Model %s → %s, trying next", MODELS[key], exc)
- 
-    raise RuntimeError("All HF models unavailable. Check your HF_API_KEY and quota.")
- 
+            last_error = exc
+            logger.warning("Model %s → %s, trying next", model_id, exc)
+            time.sleep(1)
+
+    raise RuntimeError(f"All models unavailable. Last error: {last_error}")
+
+
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
- 
+
 LIT_QC_SYSTEM = """You are a senior research scientist performing a rapid literature quality-control check.
 Given a scientific hypothesis, determine if this experiment has already been published.
- 
+
 Respond ONLY in valid JSON (no markdown, no prose outside JSON):
 {
   "novelty_signal": "not found" | "similar work exists" | "exact match found",
@@ -162,22 +165,22 @@ Respond ONLY in valid JSON (no markdown, no prose outside JSON):
   ],
   "summary": "2-3 sentence plain English explanation of the novelty assessment"
 }
- 
+
 Rules:
 - Maximum 3 references
 - If unsure, signal "similar work exists" (never hallucinate exact DOIs or PMIDs)
 - Be fast and approximate, not exhaustive"""
- 
+
 LIT_QC_USER = "Scientific hypothesis to assess:\n\n{hypothesis}"
- 
+
 EXPERIMENT_SYSTEM = """You are a senior Principal Investigator (PI) and research operations lead with 20+ years of bench experience.
 Generate a COMPLETE, OPERATIONALLY EXECUTABLE experiment plan.
- 
+
 The plan must be detailed enough that:
 - A lab technician can follow it without asking questions
 - A PI would approve the budget and timeline immediately
 - Materials can be ordered on Monday, work starts Friday
- 
+
 Respond ONLY in valid JSON (no markdown fences, no prose outside JSON):
 {
   "hypothesis": "clear testable statement",
@@ -246,33 +249,39 @@ Respond ONLY in valid JSON (no markdown fences, no prose outside JSON):
     }
   ]
 }
- 
+
 Be decisive. Use exact numbers. No vague phrases like 'standard conditions' or 'as appropriate'."""
- 
+
 EXPERIMENT_USER = "Generate a complete experiment plan for this hypothesis:\n\n{hypothesis}"
+
 
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
- 
+
 @app.get("/api/health")
 def health():
-    return jsonify({"status": "ok", "models": MODELS, "hf_key_set": bool(HF_API_KEY)})
- 
- 
+    return jsonify({
+        "status": "ok",
+        "models": MODELS,
+        "hf_key_set": bool(HF_API_KEY),
+        "provider": HF_PROVIDER,
+    })
+
+
 @app.post("/api/literature-qc")
 def literature_qc():
     """Stage 1: Rapid novelty / literature quality check."""
     body = request.get_json(silent=True) or {}
     hypothesis = (body.get("hypothesis") or "").strip()
- 
+
     if not hypothesis:
         return jsonify({"error": "hypothesis is required"}), 400
     if len(hypothesis) > 2000:
         return jsonify({"error": "hypothesis too long (max 2000 chars)"}), 400
- 
+
     try:
-        system_prompt = build_system_prompt(LIT_QC_SYSTEM,section="literature_qc")
+        system_prompt = build_system_prompt(LIT_QC_SYSTEM, section="literature_qc")
         raw, model_used = call_hf_with_fallback(
             system_prompt,
             LIT_QC_USER.format(hypothesis=hypothesis),
@@ -281,7 +290,7 @@ def literature_qc():
         result = _extract_json(raw)
         result["model_used"] = model_used
         return jsonify(result)
- 
+
     except json.JSONDecodeError:
         logger.error("JSON parse failed. Raw: %s", raw[:300])
         return jsonify({"error": "Model returned malformed JSON", "raw": raw[:500]}), 502
@@ -290,19 +299,19 @@ def literature_qc():
     except Exception as exc:
         logger.exception("literature_qc error")
         return jsonify({"error": str(exc)}), 500
- 
- 
+
+
 @app.post("/api/experiment-plan")
 def experiment_plan():
     """Stage 2: Full operational experiment plan."""
     body = request.get_json(silent=True) or {}
     hypothesis = (body.get("hypothesis") or "").strip()
- 
+
     if not hypothesis:
         return jsonify({"error": "hypothesis is required"}), 400
- 
+
     try:
-        system_prompt = build_system_prompt(EXPERIMENT_SYSTEM,section="experiment_plan")
+        system_prompt = build_system_prompt(EXPERIMENT_SYSTEM, section="experiment_plan")
         raw, model_used = call_hf_with_fallback(
             system_prompt,
             EXPERIMENT_USER.format(hypothesis=hypothesis),
@@ -310,7 +319,7 @@ def experiment_plan():
         result = _extract_json(raw)
         result["model_used"] = model_used
         return jsonify(result)
- 
+
     except json.JSONDecodeError:
         logger.error("JSON parse failed. Raw: %s", raw[:300])
         return jsonify({"error": "Model returned malformed JSON", "raw": raw[:500]}), 502
@@ -319,8 +328,8 @@ def experiment_plan():
     except Exception as exc:
         logger.exception("experiment_plan error")
         return jsonify({"error": str(exc)}), 500
- 
- 
+
+
 @app.post("/api/feedback")
 def save_feedback():
     """Stretch goal: save scientist review feedback for future few-shot improvement."""
@@ -329,7 +338,7 @@ def save_feedback():
     missing = required - body.keys()
     if missing:
         return jsonify({"error": f"Missing fields: {missing}"}), 400
- 
+
     # Persist to JSONL file (swap for a DB in production)
     feedback_path = os.path.join(os.path.dirname(__file__), "feedback_store.jsonl")
     entry = {
@@ -343,18 +352,18 @@ def save_feedback():
     }
     with open(feedback_path, "a") as fh:
         fh.write(json.dumps(entry) + "\n")
- 
+
     logger.info("Feedback saved: section=%s rating=%s", entry["section"], entry["rating"])
     return jsonify({"status": "saved", "id": int(time.time())})
- 
- 
+
+
 @app.get("/api/feedback/stats")
 def feedback_stats():
     """Return aggregate feedback stats."""
     feedback_path = os.path.join(os.path.dirname(__file__), "feedback_store.jsonl")
     if not os.path.exists(feedback_path):
         return jsonify({"total": 0, "by_section": {}})
- 
+
     entries = []
     with open(feedback_path) as fh:
         for line in fh:
@@ -362,11 +371,11 @@ def feedback_stats():
                 entries.append(json.loads(line))
             except Exception:
                 pass
- 
+
     by_section: dict[str, list] = {}
     for e in entries:
         by_section.setdefault(e["section"], []).append(e["rating"])
- 
+
     stats = {
         "total": len(entries),
         "by_section": {
@@ -383,7 +392,7 @@ def feedback_stats():
 # ---------------------------------------------------------------------------
 # Utility
 # ---------------------------------------------------------------------------
- 
+
 def _extract_json(text: str) -> dict:
     """Pull the first {...} JSON block out of model output."""
     # Strip markdown fences
@@ -393,7 +402,7 @@ def _extract_json(text: str) -> dict:
     if start == -1 or end == 0:
         raise json.JSONDecodeError("No JSON object found", text, 0)
     return json.loads(text[start:end])
- 
- 
+
+
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
