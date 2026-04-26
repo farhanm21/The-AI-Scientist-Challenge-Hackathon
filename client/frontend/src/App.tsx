@@ -290,7 +290,7 @@ export default function App() {
         fontSize: 12, color: "#bbb", borderTop: "1px solid #e8e8e8",
         marginTop: "3rem", background: "#fff",
       }}>
-        SciLab · Powered by Mistral-7B, Zephyr-7B, Phi-3 via Hugging Face Inference API · Open-source stack
+        SciLab-Made for Hackathon
       </footer>
     </div>
   );

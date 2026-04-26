@@ -1,6 +1,3 @@
-/**
- * SciLab API client — typed wrappers around Flask backend
- */
 
 const BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:5000";
 
