@@ -6,7 +6,8 @@ from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from dotenv import load_dotenv
 import requests
- 
+from feedback_loop import load_feedback_examples, format_fewshot_block, build_system_prompt
+
 load_dotenv()
  
 logging.basicConfig(
@@ -58,6 +59,7 @@ def _build_instruct_prompt(system: str, user: str, model_id: str) -> str:
  
  
 def call_hf_model(system_prompt: str, user_prompt: str, model_key: str = "primary") -> str:
+ 
     """Call HF Inference API and return text response."""
     model_id = MODELS.get(model_key, MODELS["primary"])
     url      = f"{HF_BASE_URL}/{model_id}"
@@ -236,8 +238,9 @@ def literature_qc():
         return jsonify({"error": "hypothesis too long (max 2000 chars)"}), 400
  
     try:
+        system_prompt = build_system_prompt(LIT_QC_SYSTEM,section="literature_qc")
         raw, model_used = call_hf_with_fallback(
-            LIT_QC_SYSTEM,
+            system_prompt,
             LIT_QC_USER.format(hypothesis=hypothesis),
         )
         # Extract JSON from response (model may wrap it in prose)
@@ -265,8 +268,9 @@ def experiment_plan():
         return jsonify({"error": "hypothesis is required"}), 400
  
     try:
+        system_prompt = build_system_prompt(EXPERIMENT_SYSTEM,section="experiment_plan")
         raw, model_used = call_hf_with_fallback(
-            EXPERIMENT_SYSTEM,
+            system_prompt,
             EXPERIMENT_USER.format(hypothesis=hypothesis),
         )
         result = _extract_json(raw)
