@@ -7,6 +7,7 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 import requests
 from feedback_loop import load_feedback_examples, format_fewshot_block, build_system_prompt
+from huggingface_hub import InferenceClient
 
 load_dotenv()
  
@@ -23,14 +24,20 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 # Config
 # ---------------------------------------------------------------------------
 HF_API_KEY = os.getenv("HF_API_KEY", "")          # Hugging Face token
-HF_BASE_URL = "https://api-inference.huggingface.co/models"
+# HF_BASE_URL = "https://api-inference.huggingface.co/models"
  
 # Open-source models available on HF Inference API (free tier)
-MODELS = {
-    "primary":   "mistralai/Mistral-7B-Instruct-v0.3",
-    "fallback":  "HuggingFaceH4/zephyr-7b-beta",
-    "fast":      "microsoft/Phi-3-mini-4k-instruct",
-}
+# MODELS = {
+#     "primary":  "meta-llama/Llama-3.1-8B-Instruct",
+#     "fallback": "meta-llama/Llama-3.1-8B-Instruct",
+#     "fast":     "meta-llama/Llama-3.1-8B-Instruct",
+# }
+
+client = InferenceClient(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    token=HF_API_KEY,
+    provider="novita"
+)
  
 HEADERS = {
     "Authorization": f"Bearer {HF_API_KEY}",
@@ -45,51 +52,78 @@ REQUEST_TIMEOUT = 120   # seconds
 # ---------------------------------------------------------------------------
 # HF Inference helpers
 # ---------------------------------------------------------------------------
- 
 def _build_instruct_prompt(system: str, user: str, model_id: str) -> str:
-    """Format prompt correctly for different instruct models."""
+    """Format prompt correctly for Llama models."""
+
+    if "llama" in model_id.lower():
+        return f"""<|system|>
+{system}
+<|user|>
+{user}
+<|assistant|>"""
+
     if "mistral" in model_id.lower() or "mixtral" in model_id.lower():
         return f"[INST] {system}\n\n{user} [/INST]"
+
     if "zephyr" in model_id.lower():
         return f"<|system|>\n{system}</s>\n<|user|>\n{user}</s>\n<|assistant|>"
+
     if "phi" in model_id.lower():
         return f"<|system|>\n{system}<|end|>\n<|user|>\n{user}<|end|>\n<|assistant|>"
-    # Generic fallback
+
     return f"### System:\n{system}\n\n### User:\n{user}\n\n### Assistant:"
  
  
+# def call_hf_model(system_prompt: str, user_prompt: str, model_key: str = "primary") -> str:
+ 
+#     """Call HF Inference API and return text response."""
+#     model_id = MODELS.get(model_key, MODELS["primary"])
+#     url      = f"{HF_BASE_URL}/{model_id}"
+#     prompt   = _build_instruct_prompt(system_prompt, user_prompt, model_id)
+ 
+#     payload = {
+#         "inputs": prompt,
+#         "parameters": {
+#             "max_new_tokens":  MAX_TOKENS,
+#             "temperature":     TEMPERATURE,
+#             "do_sample":       True,
+#             "return_full_text": False,
+#             "stop": ["</s>", "[INST]", "### User:"],
+#         },
+#         "options": {"wait_for_model": True, "use_cache": False},
+#     }
+ 
+#     logger.info("Calling HF model: %s", model_id)
+#     resp = requests.post(url, headers=HEADERS, json=payload, timeout=REQUEST_TIMEOUT)
+#     resp.raise_for_status()
+ 
+#     data = resp.json()
+#     if isinstance(data, list) and data:
+#         return data[0].get("generated_text", "").strip()
+#     if isinstance(data, dict) and "generated_text" in data:
+#         return data["generated_text"].strip()
+ 
+#     raise ValueError(f"Unexpected HF response shape: {data}")
+ 
 def call_hf_model(system_prompt: str, user_prompt: str, model_key: str = "primary") -> str:
- 
-    """Call HF Inference API and return text response."""
     model_id = MODELS.get(model_key, MODELS["primary"])
-    url      = f"{HF_BASE_URL}/{model_id}"
-    prompt   = _build_instruct_prompt(system_prompt, user_prompt, model_id)
- 
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_new_tokens":  MAX_TOKENS,
-            "temperature":     TEMPERATURE,
-            "do_sample":       True,
-            "return_full_text": False,
-            "stop": ["</s>", "[INST]", "### User:"],
-        },
-        "options": {"wait_for_model": True, "use_cache": False},
-    }
- 
-    logger.info("Calling HF model: %s", model_id)
-    resp = requests.post(url, headers=HEADERS, json=payload, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
- 
-    data = resp.json()
-    if isinstance(data, list) and data:
-        return data[0].get("generated_text", "").strip()
-    if isinstance(data, dict) and "generated_text" in data:
-        return data["generated_text"].strip()
- 
-    raise ValueError(f"Unexpected HF response shape: {data}")
- 
- 
+
+    client = InferenceClient(
+        model=model_id,
+        token=HF_API_KEY,
+        provider="novita"
+    )
+
+    response = client.chat_completion(
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        max_tokens=MAX_TOKENS,
+        temperature=TEMPERATURE,
+    )
+
+    return response.choices[0].message.content.strip()
 def call_hf_with_fallback(system_prompt: str, user_prompt: str) -> tuple[str, str]:
     """Try primary model, fall back gracefully. Returns (text, model_used)."""
     for key in ("primary", "fallback", "fast"):
