@@ -40,9 +40,24 @@ MODELS = {
 #     "Content-Type":  "application/json",
 # }
 
-MAX_TOKENS   = 3000
-TEMPERATURE  = 0.3
-REQUEST_TIMEOUT = 120   # seconds
+MAX_TOKENS      = 4000
+TEMPERATURE     = 0.2
+REQUEST_TIMEOUT  = 120   # seconds
+
+_CLIENT_CACHE: dict[str, InferenceClient] = {}
+
+def _get_client(model_id: str) -> InferenceClient:
+    """Create and cache one client per model/provider combination."""
+    cache_key = f"{HF_PROVIDER}:{model_id}"
+    if cache_key not in _CLIENT_CACHE:
+        _CLIENT_CACHE[cache_key] = InferenceClient(
+            model=model_id,
+            token=HF_API_KEY,
+            provider=HF_PROVIDER
+        )
+    return _CLIENT_CACHE[cache_key]
+
+client = _get_client(MODELS["primary"]) if HF_API_KEY else None
 
 
 # ---------------------------------------------------------------------------
@@ -102,38 +117,52 @@ def _build_instruct_prompt(system: str, user: str, model_id: str) -> str:
 #
 #     raise ValueError(f"Unexpected HF response shape: {data}")
 
-def call_hf_model(system_prompt: str, user_prompt: str, model_key: str = "primary") -> str:
+def call_hf_model(
+    system_prompt: str,
+    user_prompt: str,
+    model_key: str = "primary",
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+) -> str:
     if not HF_API_KEY:
         raise RuntimeError("HF_API_KEY / HF_TOKEN is not set in .env")
 
     model_id = MODELS.get(model_key, MODELS["primary"])
+    active_client = client if (model_id == MODELS["primary"] and client is not None) else _get_client(model_id)
 
-    client = InferenceClient(
-        model=model_id,
-        token=HF_API_KEY,
-        provider=HF_PROVIDER
-    )
-
-    response = client.chat_completion(
+    response = active_client.chat_completion(
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        max_tokens=MAX_TOKENS,
-        temperature=TEMPERATURE,
+        max_tokens=max_tokens or MAX_TOKENS,
+        temperature=TEMPERATURE if temperature is None else temperature,
     )
 
     return response.choices[0].message.content.strip()
 
 
-def call_hf_with_fallback(system_prompt: str, user_prompt: str) -> tuple[str, str]:
-    """Try primary model, fall back gracefully. Returns (text, model_used)."""
+def call_hf_with_fallback(
+    system_prompt: str,
+    user_prompt: str,
+    preferred_keys: tuple[str, ...] | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+) -> tuple[str, str]:
+    """Try preferred models in order, fall back gracefully. Returns (text, model_used)."""
     last_error = None
+    order = preferred_keys or ("primary", "fallback", "fast")
 
-    for key in ("primary", "fallback", "fast"):
+    for key in order:
         model_id = MODELS.get(key, MODELS["primary"])
         try:
-            text = call_hf_model(system_prompt, user_prompt, key)
+            text = call_hf_model(
+                system_prompt,
+                user_prompt,
+                model_key=key,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
             return text, model_id
         except Exception as exc:
             last_error = exc
@@ -250,9 +279,98 @@ Respond ONLY in valid JSON (no markdown fences, no prose outside JSON):
   ]
 }
 
-Be decisive. Use exact numbers. No vague phrases like 'standard conditions' or 'as appropriate'."""
+Important:
+- Keep the JSON compact but complete.
+- Use concise wording in every field.
+- Do not include markdown, explanations, or code fences.
+- Return only a single JSON object that starts with { and ends with }."""
 
 EXPERIMENT_USER = "Generate a complete experiment plan for this hypothesis:\n\n{hypothesis}"
+
+
+# ---------------------------------------------------------------------------
+# JSON helpers
+# ---------------------------------------------------------------------------
+
+def _extract_json(text: str) -> dict:
+    """Pull the first complete {...} JSON object out of model output."""
+    text = text.replace("```json", "").replace("```", "").strip()
+
+    start = text.find("{")
+    if start == -1:
+        raise json.JSONDecodeError("No JSON object found", text, 0)
+
+    depth = 0
+    in_string = False
+    escape = False
+    end = None
+
+    for idx in range(start, len(text)):
+        ch = text[idx]
+
+        if escape:
+            escape = False
+            continue
+
+        if ch == "\\":
+            escape = True
+            continue
+
+        if ch == '"':
+            in_string = not in_string
+            continue
+
+        if in_string:
+            continue
+
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = idx + 1
+                break
+
+    if end is None:
+        raise json.JSONDecodeError("No complete JSON object found", text, start)
+
+    candidate = text[start:end].strip()
+    return json.loads(candidate)
+
+
+def _extract_json_with_repair(
+    raw_text: str,
+    task_prompt: str,
+    preferred_keys: tuple[str, ...] | None = None,
+) -> tuple[dict, bool, str | None]:
+    """
+    Parse JSON directly; if it fails, ask the model to repair the output once.
+    Returns (parsed_dict, repaired?, repair_model_used).
+    """
+    try:
+        return _extract_json(raw_text), False, None
+    except json.JSONDecodeError:
+        repair_system = (
+            "You are a strict JSON repair assistant. "
+            "Return ONLY valid JSON and nothing else. "
+            "Do not add markdown fences, explanations, or commentary."
+        )
+        repair_user = f"""Fix the following output so it becomes valid JSON matching the original task.
+
+ORIGINAL TASK:
+{task_prompt}
+
+BROKEN OUTPUT:
+{raw_text}
+
+Return only the corrected JSON object."""
+        repaired_raw, repair_model = call_hf_with_fallback(
+            repair_system,
+            repair_user,
+            preferred_keys=preferred_keys,
+            temperature=0.0,
+        )
+        return _extract_json(repaired_raw), True, repair_model
 
 
 # ---------------------------------------------------------------------------
@@ -285,10 +403,18 @@ def literature_qc():
         raw, model_used = call_hf_with_fallback(
             system_prompt,
             LIT_QC_USER.format(hypothesis=hypothesis),
+            preferred_keys=("primary", "fast", "fallback"),
+            temperature=0.15,
         )
-        # Extract JSON from response (model may wrap it in prose)
-        result = _extract_json(raw)
+        result, repaired, repair_model = _extract_json_with_repair(
+            raw,
+            LIT_QC_USER.format(hypothesis=hypothesis),
+            preferred_keys=("primary", "fast", "fallback"),
+        )
         result["model_used"] = model_used
+        if repaired:
+            result["json_repaired"] = True
+            result["repair_model_used"] = repair_model
         return jsonify(result)
 
     except json.JSONDecodeError:
@@ -315,9 +441,18 @@ def experiment_plan():
         raw, model_used = call_hf_with_fallback(
             system_prompt,
             EXPERIMENT_USER.format(hypothesis=hypothesis),
+            preferred_keys=("fallback", "primary", "fast"),
+            temperature=0.15,
         )
-        result = _extract_json(raw)
+        result, repaired, repair_model = _extract_json_with_repair(
+            raw,
+            EXPERIMENT_USER.format(hypothesis=hypothesis),
+            preferred_keys=("fallback", "primary", "fast"),
+        )
         result["model_used"] = model_used
+        if repaired:
+            result["json_repaired"] = True
+            result["repair_model_used"] = repair_model
         return jsonify(result)
 
     except json.JSONDecodeError:
